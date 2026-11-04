@@ -2,50 +2,67 @@ import React, {useState, useEffect, useRef} from 'react';
 import {createRoot} from 'react-dom/client';
 import {ArrowUpRight, ArrowRight, Plus, LayoutGrid, Layers, Smartphone, Brain, Activity, Settings, ShieldCheck, ChevronDown, ChevronRight, MoreHorizontal, Sun, Moon, Coffee, Sparkles, Play, X, Check, Monitor, Link, LockKeyhole, Trash2, Search, ArrowUp, Pause, FileText, Bell, CalendarDays, WifiOff, CheckCheck, ExternalLink} from 'lucide-react';
 import QRCode from 'qrcode';
+import {withCollectionTransaction, readCollection, InvalidCollectionError} from './collectionStorage.js';
 import './style.css';
 const icons={Sun,Moon,Coffee,Sparkles};
 const newId=()=>globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 function readLocal(key,fallback){try{return JSON.parse(localStorage.getItem(key)||'null')??fallback}catch{return fallback}}
+function readLocalCollection(key,fallback){try{return readCollection(key,fallback)}catch{return fallback}}
 const baseScenes=[{id:1,name:'Start my day',desc:'A little clarity before the day begins.',icon:'Sun',color:'peach',apps:['Calendar','Weather','Notes'],steps:'Check my calendar, review the weather, and prepare a short daily briefing.'},{id:2,name:'Time to focus',desc:'Less noise. More room for the good work.',icon:'Coffee',color:'sage',apps:['Focus','Music'],steps:'Enable Focus, start a calm playlist, and set a 45 minute timer.'},{id:3,name:'Wind down',desc:'Close the tabs in your mind, too.',icon:'Moon',color:'lavender',apps:['Reminders','Health'],steps:'Review tomorrow’s reminders and begin my evening wind-down routine.'}];
 function App(){
 const [page,setPage]=useState('Overview'),[modal,setModal]=useState(null),[toast,setToast]=useState(''),[prompt,setPrompt]=useState(''),[search,setSearch]=useState(''),[sceneName,setSceneName]=useState(''),[sceneSteps,setSceneSteps]=useState(''),[qr,setQr]=useState(''),[step,setStep]=useState(0);
-const [scenes,setScenes]=useState(()=>readLocal('andee-scenes',baseScenes));
-const [memories,setMemories]=useState(()=>readLocal('andee-memory',[]));
+const [scenes,setScenes]=useState(()=>readLocalCollection('andee-scenes',baseScenes));
+const [memories,setMemories]=useState(()=>readLocalCollection('andee-memory',[]));
 const [model,setModel]=useState(()=>readLocal('andee-model',{name:'',url:''}));
 const [modelName,setModelName]=useState(model.name),[url,setUrl]=useState(model.url),[key,setKey]=useState(''),[modelError,setModelError]=useState(''),[busy,setBusy]=useState(false);
 const [history,setHistory]=useState(()=>readLocal('andee-history',[]));
 const [storageWarning,setStorageWarning]=useState(false);
+const [invalidCollections,setInvalidCollections]=useState({});
 const pending=useRef({'andee-scenes':[],'andee-memory':[]});
 const queues=useRef({'andee-scenes':Promise.resolve(),'andee-memory':Promise.resolve()});
-// Apply mutations to the latest persisted collection under a cross-tab lock.
-function saveCollection(key,fallback,setValue,change){
-  pending.current[key].push(change);
-  setValue(current=>change(current));
+// Queue local changes while every tab serializes its full read-modify-write.
+function saveCollection(key,fallback,setValue,change,allowRecovery=false){
+  if(change){pending.current[key].push(change);setValue(current=>change(current))}
   queues.current[key]=queues.current[key].then(async()=>{
-    if(!navigator.locks)throw new Error('Cross-tab locking is unavailable');
-    await navigator.locks.request(key,()=>{
+    const result=await withCollectionTransaction(key,()=>{
+      let stored;
+      try{stored=readCollection(key,fallback)}catch(error){
+        if(!(allowRecovery && error instanceof InvalidCollectionError))throw error;
+        stored=fallback;
+      }
       const changes=pending.current[key].slice();
-      if(!changes.length)return;
-      const stored=JSON.parse(localStorage.getItem(key)||'null')??fallback;
-      if(!Array.isArray(stored))throw new Error('Invalid saved collection');
+      if(!changes.length && !allowRecovery)return null;
       const next=changes.reduce((items,update)=>update(items),stored);
       localStorage.setItem(key,JSON.stringify(next));
-      pending.current[key].splice(0,changes.length);
-      setValue(pending.current[key].reduce((items,update)=>update(items),next));
+      return {changes,next};
     });
-  }).catch(()=>setStorageWarning(true));
+    if(result){
+      pending.current[key].splice(0,result.changes.length);
+      setValue(pending.current[key].reduce((items,update)=>update(items),result.next));
+    }
+    setInvalidCollections(current=>({...current,[key]:false}));
+  }).catch(error=>{
+    if(error instanceof InvalidCollectionError)setInvalidCollections(current=>({...current,[key]:true}));
+    else setStorageWarning(true);
+  });
+  return queues.current[key];
 }
 useEffect(()=>{
+  const configs={'andee-scenes':[baseScenes,setScenes],'andee-memory':[[],setMemories]};
+  function refresh(key){
+    const [fallback,setValue]=configs[key];
+    try{
+      const stored=readCollection(key,fallback);
+      setValue(pending.current[key].reduce((items,update)=>update(items),stored));
+      setInvalidCollections(current=>({...current,[key]:false}));
+    }catch(error){if(error instanceof InvalidCollectionError)setInvalidCollections(current=>({...current,[key]:true}))}
+  }
   function sync(event){
-    const configs={'andee-scenes':[baseScenes,setScenes],'andee-memory':[[],setMemories]};
     const keys=event.key===null?Object.keys(configs):[event.key];
-    for(const key of keys){
-      if(!configs[key])continue;
-      const [fallback,setValue]=configs[key];
-      try{const stored=JSON.parse(localStorage.getItem(key)||'null')??fallback;if(Array.isArray(stored))setValue(pending.current[key].reduce((items,update)=>update(items),stored))}catch{/* Keep unsaved state visible. */}
-    }
+    for(const key of keys)if(configs[key])refresh(key);
   }
   window.addEventListener('storage',sync);
+  Object.keys(configs).forEach(refresh);
   return()=>window.removeEventListener('storage',sync);
 },[]);
 function writeLocal(key,value){try{if(value===null)localStorage.removeItem(key);else localStorage.setItem(key,JSON.stringify(value))}catch{setStorageWarning(true)}}
@@ -61,6 +78,7 @@ async function saveModel(e){e.preventDefault();setModelError('');let u;try{u=new
 const navigation=[['Overview',LayoutGrid],['Scenes',Layers],['Devices',Smartphone],['Memory',Brain],['Activity',Activity]];
 return <div className="app"><aside className="sidebar"><a className="brand" href="#" onClick={e=>{e.preventDefault();setPage('Overview')}}><span className="brand-symbol"><i/><i/></span>andee<span className="brand-dot">®</span></a><div className="workspace"><span className="workspace-avatar">J</span><div>Personal space<small>Just for you</small></div><ChevronDown size={15}/></div><div className="nav-label">YOUR COMPANION</div><nav>{navigation.map(([name,Icon])=><button key={name} className={page===name?'active':''} onClick={()=>{setPage(name);setSearch('')}}><Icon size={19}/>{name}{name==='Devices'&&<span className="nav-count">1</span>}{name==='Overview'&&<span className="active-dot"/>}</button>)}</nav><div className="sidebar-bottom"><div className="local-note"><div className="local-note-icon"><ShieldCheck size={19}/></div><strong>Your world stays yours.</strong><p>Local memory. No analytics.<br/>Always under your control.</p><button onClick={()=>setModal('privacy')}>Our privacy promise <ArrowUpRight size={13}/></button></div><button className={'settings-nav '+(page==='Settings'?'selected':'')} onClick={()=>setPage('Settings')}><Settings size={19}/>Settings</button><button className="profile" onClick={()=>{setStep(0);setModal('onboarding')}}><span className="avatar">J</span><span>Your personal space<small>Local workspace</small></span><MoreHorizontal size={19}/></button></div></aside>
 <div className="main-shell"><header><div className="breadcrumb">Your space <ChevronRight size={13}/><span>{page}</span></div><div className="header-right"><span className="local-status"><span/>Local workspace</span><span className="header-divider"/><button aria-label="What's new" onClick={()=>setModal('updates')}><Bell size={18}/></button><span className="avatar small">J</span></div></header><main>
+{Object.entries(invalidCollections).filter(([,invalid])=>invalid).map(([key])=><div className="recovery-warning" role="alert" key={key}><span>Saved {key==='andee-scenes'?'scenes':'memories'} are malformed. Resetting will discard the malformed data and retry your pending changes.</span><button onClick={()=>key==='andee-scenes'?saveCollection(key,baseScenes,setScenes,null,true):saveCollection(key,[],setMemories,null,true)}>Reset {key==='andee-scenes'?'scenes':'memories'} and retry</button></div>)}
 {page==='Overview'?<><div className="page-title"><div><div className="eyebrow">A LITTLE MORE PRESENT.</div><h1>Life happens. Andee helps<span>.</span></h1><p>Your everyday, a little lighter. What’s on your mind?</p></div><div className="date"><Sun size={16}/> {new Date().toLocaleDateString('en-US',{month:'short',day:'numeric'})}</div></div>
 <section className="hero"><div className="hero-copy"><div className="status-pill"><span/> HERE WHEN YOU NEED ME</div><h2>A little help.<br/>A lot more headspace.</h2><p>From your first coffee to your last to-do.<br/>Your companion, right here on your device.</p><button className="dark-button" onClick={()=>{document.getElementById('ask').focus()}}>Let’s do something <ArrowUpRight size={16}/></button></div><div className="hero-art" aria-label="Andee, your friendly local companion"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><span className="art-spark spark-one">✳</span><span className="art-spark spark-two">✧</span><div className="floating-chip chip-one"><Check size={14}/> A little less on your plate</div><div className="mascot"><div className="mascot-shine"/><div className="eyes"><i/><i/></div><span className="cheek left"/><span className="cheek right"/><div className="smile"/></div><div className="mascot-shadow"/><div className="floating-chip chip-two"><ShieldCheck size={15}/> Private by nature</div></div></section>
 <section className="ask-box"><div className="ask-icon"><Sparkles size={19}/></div><input id="ask" value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&prompt.trim()){setModal('task')}}} placeholder="Ask Andee to take something off your plate…"/><span className="keyboard">↵</span><button aria-label="Submit task" disabled={!prompt.trim()} onClick={()=>setModal('task')}><ArrowUp size={19}/></button></section><div className="ask-caption"><LockKeyhole size={11}/> Your context stays on this device. You decide what to share.</div>
@@ -74,6 +92,7 @@ return <div className="app"><aside className="sidebar"><a className="brand" href
 {page==='Settings'&&<div className="settings-list"><button onClick={()=>setModal('model')}><span className="setting-icon"><Sparkles/></span><span><strong>Your model</strong><small>{model.name||'Connect an OpenAI-compatible endpoint'}</small></span><ChevronRight/></button><button onClick={()=>setModal('permissions')}><span className="setting-icon"><ShieldCheck/></span><span><strong>Permissions & control</strong><small>Understand what native device access needs</small></span><ChevronRight/></button><button onClick={()=>setModal('privacy')}><span className="setting-icon"><LockKeyhole/></span><span><strong>Privacy promise</strong><small>Local storage, transparent boundaries, zero analytics</small></span><ChevronRight/></button><button onClick={()=>{setStep(0);setModal('onboarding')}}><span className="setting-icon"><Sun/></span><span><strong>Meet Andee</strong><small>A quick walk through your companion</small></span><ChevronRight/></button></div>}
 </>}
 </main></div>
+
 {storageWarning&&<div className="storage-warning" role="alert">Some changes could not be saved to this browser. They may be lost when you close or reload this tab.<button aria-label="Dismiss storage warning" onClick={()=>setStorageWarning(false)}><X size={16}/></button></div>}
 {toast&&<div className="toast"><Check size={17}/>{toast}</div>}
 {modal&&<div className="modal-overlay" onClick={()=>setModal(null)}><section className="modal" role="dialog" aria-modal="true" aria-label="Andee dialog" onClick={e=>e.stopPropagation()}><button className="close" aria-label="Close dialog" onClick={()=>setModal(null)}><X size={20}/></button>
@@ -81,8 +100,8 @@ return <div className="app"><aside className="sidebar"><a className="brand" href
 {modal==='pair'&&<><div className="modal-icon"><Smartphone/></div><h2>A little closer, everywhere.</h2><p>Scan this pairing invitation with another device.</p><img className="qr" src={qr} alt="Andee pairing invitation QR code"/><div className="notice">Preview invitation · expires in 5 minutes.<br/>Device pairing requires native Andee apps and is not connected in this web preview. This code contains no personal information.</div><button className="text-button" onClick={pair}>Generate a new invitation <ArrowRight size={15}/></button></>}
 {modal==='privacy'&&<><div className="modal-icon"><ShieldCheck/></div><h2>Your world stays yours.</h2><p>Privacy should be something you can understand.</p><div className="promise"><Check/> No analytics or tracking scripts.</div><div className="promise"><Check/> Memory, scenes, and activity stay in this browser.</div><div className="promise"><Check/> No hidden Andee backend.</div><div className="promise"><Check/> API keys are never stored.</div><div className="notice">This is a web companion preview. Native screen reading, private field redaction, encrypted storage, and cross-device pairing are not implemented. A remote model provider receives requests you explicitly make to it. Fonts are loaded from Google Fonts.</div><button className="dark-button" onClick={()=>{setModal(null);setPage('Memory')}}>Explore your memory <ArrowRight size={15}/></button></>}
 {modal==='permissions'&&<><div className="modal-icon"><ShieldCheck/></div><h2>You’re in control.</h2><p>In native apps, Andee would ask for each permission when needed.</p><div className="permission"><strong>Accessibility</strong><p>Read interface elements and perform taps or typing on Android. Requires explicit system approval.</p></div><div className="permission"><strong>Screen capture</strong><p>Understand what’s visible on screen with your consent.</p></div><div className="permission"><strong>Mac companion</strong><p>Accessibility and Screen Recording access must be granted in macOS settings.</p></div><div className="notice">Unavailable in this browser. No device permissions have been requested or granted.</div></>}
-{modal==='new-scene'&&<><div className="modal-icon"><Layers/></div><h2>Make a little routine.</h2><p>Give Andee a plan for those everyday moments.</p><form onSubmit={e=>{e.preventDefault();if(!sceneSteps.trim()){e.currentTarget.elements.plan.setCustomValidity('Please enter a scene plan.');e.currentTarget.elements.plan.reportValidity();return}const scene={id:newId(),name:sceneName.trim(),desc:'A routine made just for you.',steps:sceneSteps.trim(),icon:'Sparkles',color:'sage',apps:['Custom']};saveScenes(items=>[...items,scene]);setModal(null);notify('Your scene is ready to preview.')}}><label>Scene name<input required maxLength={60} value={sceneName} onChange={e=>setSceneName(e.target.value)} placeholder="A quiet Sunday" pattern=".*\S.*"/></label><label>What should happen?<textarea name="plan" required value={sceneSteps} onChange={e=>{e.target.setCustomValidity('');setSceneSteps(e.target.value)}} placeholder="Describe the steps in your routine…"/></label><button className="dark-button">Create scene <Plus size={16}/></button></form></>}
-{modal==='memory'&&<><div className="modal-icon"><Brain/></div><h2>A little thing to remember.</h2><p>Add a preference. Keep passwords and private data out.</p><form onSubmit={e=>{e.preventDefault();if(!sceneSteps.trim())return;const memory={id:newId(),text:sceneSteps.trim()};saveMem(items=>[...items,memory]);setModal(null)}}><label>Your memory<textarea required value={sceneSteps} onChange={e=>setSceneSteps(e.target.value)} placeholder="I like to start my day with a short walk."/></label><button className="dark-button">Save locally <Check size={16}/></button></form></>}
+{modal==='new-scene'&&<><div className="modal-icon"><Layers/></div><h2>Make a little routine.</h2><p>Give Andee a plan for those everyday moments.</p><form onSubmit={e=>{e.preventDefault();if(!sceneSteps.trim()){e.currentTarget.elements.plan.setCustomValidity('Please enter a scene plan.');e.currentTarget.elements.plan.reportValidity();return}const scene={id:newId(),name:sceneName.trim(),desc:'A routine made just for you.',steps:sceneSteps.trim(),icon:'Sparkles',color:'sage',apps:['Custom']};saveScenes(items=>items.some(item=>item.id===scene.id)?items:[...items,scene]);setModal(null);notify('Your scene is ready to preview.')}}><label>Scene name<input required maxLength={60} value={sceneName} onChange={e=>setSceneName(e.target.value)} placeholder="A quiet Sunday" pattern=".*\S.*"/></label><label>What should happen?<textarea name="plan" required value={sceneSteps} onChange={e=>{e.target.setCustomValidity('');setSceneSteps(e.target.value)}} placeholder="Describe the steps in your routine…"/></label><button className="dark-button">Create scene <Plus size={16}/></button></form></>}
+{modal==='memory'&&<><div className="modal-icon"><Brain/></div><h2>A little thing to remember.</h2><p>Add a preference. Keep passwords and private data out.</p><form onSubmit={e=>{e.preventDefault();if(!sceneSteps.trim())return;const memory={id:newId(),text:sceneSteps.trim()};saveMem(items=>items.some(item=>item.id===memory.id)?items:[...items,memory]);setModal(null)}}><label>Your memory<textarea required value={sceneSteps} onChange={e=>setSceneSteps(e.target.value)} placeholder="I like to start my day with a short walk."/></label><button className="dark-button">Save locally <Check size={16}/></button></form></>}
 {modal==='delete-memory'&&<><h2>Let it all go?</h2><p>This permanently deletes all saved memories from this browser.</p><button className="danger-button" onClick={()=>{const ids=new Set(memories.map(m=>m.id));saveMem(items=>items.filter(m=>!ids.has(m.id)));setModal(null);notify('All memories deleted.')}}>Delete all memories</button></>}
 {modal?.type==='scene'&&<><div className={'scene-icon '+modal.scene.color}>{React.createElement(icons[modal.scene.icon]||Sparkles,{size:26})}</div><h2>{modal.scene.name}</h2><p>{modal.scene.desc}</p><div className="plan"><span>THE PLAN</span><p>{modal.scene.steps}</p></div><div className="notice">Preview the routine’s steps. App automation requires a native Andee app.</div><div className="modal-actions"><button className="dark-button" onClick={()=>run(modal.scene)}>Preview scene <Play size={15}/></button><button className="icon-button" aria-label="Delete scene" onClick={()=>{saveScenes(items=>items.filter(s=>s.id!==modal.scene.id));setModal(null);notify('Scene deleted')}}><Trash2 size={18}/></button></div></>}
 {modal?.type==='run'&&<><div className="modal-icon"><Play/></div><div className="eyebrow">SCENE PREVIEW</div><h2>{modal.scene.name}</h2><p>Here’s what Andee would do on your device.</p>{modal.scene.steps.split(/, | and /).map((s,i)=><div className="preview-step" key={i}><span>{i+1}</span>{s}</div>)}<div className="notice">No apps were opened or changed. Native automation is not available in this web companion.</div><button className="dark-button" onClick={()=>setModal(null)}>Got it <Check size={16}/></button></>}
