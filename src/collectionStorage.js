@@ -1,5 +1,5 @@
-// All writers, including those with Web Locks, use the same IndexedDB transaction
-// so tabs with different lock support cannot race on the localStorage collection.
+// When all tabs have IndexedDB, its transaction coordinates differing Web Lock support.
+// Without IndexedDB, only tabs using the same Web Lock are coordinated.
 export function withCollectionTransaction(key, update) {
   const transact = () => new Promise((resolve, reject) => {
     let blocked = false;
@@ -23,7 +23,9 @@ export function withCollectionTransaction(key, update) {
       } catch (error) { db.close(); reject(error); }
     };
   });
-  return navigator.locks ? navigator.locks.request(key, transact) : transact();
+  if (!navigator.locks) return transact();
+  const coordinated = typeof indexedDB === 'undefined' ? () => Promise.resolve().then(update) : transact;
+  return navigator.locks.request(key, coordinated);
 }
 
 export class InvalidCollectionError extends Error {}

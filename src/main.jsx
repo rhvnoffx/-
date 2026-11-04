@@ -20,7 +20,7 @@ const [storageWarning,setStorageWarning]=useState(false);
 const [invalidCollections,setInvalidCollections]=useState({});
 const pending=useRef({'andee-scenes':[],'andee-memory':[]});
 const queues=useRef({'andee-scenes':Promise.resolve(),'andee-memory':Promise.resolve()});
-// Queue local changes while every tab serializes its full read-modify-write.
+// Queue local changes for the available storage coordination path.
 function saveCollection(key,fallback,setValue,change,allowRecovery=false){
   if(change){pending.current[key].push(change);setValue(current=>change(current))}
   queues.current[key]=queues.current[key].then(async()=>{
